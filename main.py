@@ -1,154 +1,144 @@
 import cv2
+import time
+import threading
 
-from alert_system import AlertSystem
+from pose_detection import get_pose
 from fall_detection import detect_fall
-from monitoring import PostFallMonitor
-from pose_detection import close_pose_detector, get_landmarks
+from camera_motion import camera_moved
+
+from video_recorder import (
+    buffer_frame,
+    start_recording,
+    record_frame,
+    recording_finished,
+    stop_recording
+)
+
+from alert_system import (
+    send_alert_message,
+    send_alert_image,
+    send_alert_video
+)
+
+cap = cv2.VideoCapture(0)
+
+recording_active = False
+fall_start_time = None
+alert_cooldown = False
+cooldown_start = None
+COOLDOWN_TIME = 8
 
 
-def run(video_source=0):
+def send_alerts(video_file):
+    send_alert_message()
+    send_alert_image("fall_snapshot.jpg")
+    send_alert_video(video_file)
 
-    cap = cv2.VideoCapture(video_source)
 
-    if not cap.isOpened():
-        raise RuntimeError("Could not open camera/video source.")
+while True:
 
-    alert_system = AlertSystem(alert_delay=10, escalation_delay=15)
-    monitor = PostFallMonitor(no_movement_time=10)
+    ret, frame = cap.read()
 
-    try:
+    if not ret:
+        break
 
-        while True:
+    status = "Monitoring"
+    color = (0,255,0)
 
-            ok, frame = cap.read()
+    buffer_frame(frame)
 
-            if not ok:
-                break
+    # cooldown after alert
+    if alert_cooldown:
+        if time.time() - cooldown_start > COOLDOWN_TIME:
+            alert_cooldown = False
+        else:
+            status = "Cooldown"
+            color = (255,255,0)
 
-            landmarks, annotated = get_landmarks(frame)
+    # detect camera movement
+    if camera_moved(frame):
 
-            status_text = "Monitoring..."
-            color = (0, 255, 0)
+        status = "Camera Moving"
+        color = (0,255,255)
 
-            if landmarks is not None:
+        cv2.putText(frame,status,(20,40),
+                    cv2.FONT_HERSHEY_SIMPLEX,1,color,2)
 
-                fall_state = detect_fall(landmarks)
+        cv2.imshow("Fall Detection System",frame)
 
-                monitor_state = monitor.update(
-                    fall_detected=fall_state["fall_detected"],
-                    movement=fall_state["movement"],
-                    lying=fall_state["lying"],
-                    recovered=fall_state["recovered"],
-                )
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-                alert_state = alert_system.process_fall_state(
-                    fall_detected=fall_state["fall_detected"],
-                    recovered=fall_state["recovered"],
-                    movement=fall_state["movement"],
-                    frame=frame,
-                )
+        continue
 
-                # -------- STATE DISPLAY --------
+    # pose detection
+    data = get_pose(frame)
 
-                if fall_state["fall_detected"]:
-                    status_text = "FALL DETECTED"
-                    color = (0, 165, 255)
+    if data is not None:
 
-                elif fall_state["lying"]:
-                    status_text = "PERSON LYING"
-                    color = (255, 0, 255)
+        angle = round(data["angle"],1)
+        height = round(data["hip_height"],2)
+        aspect = round(data["aspect_ratio"],2)
 
-                if monitor_state["no_movement_alert"]:
-                    status_text = "NO MOVEMENT ALERT"
-                    color = (0, 0, 255)
+        debug_text = f"Angle:{angle}  Height:{height}  Aspect:{aspect}"
 
-                if fall_state["recovered"]:
-                    status_text = "RECOVERED"
-                    color = (255, 255, 0)
-
-                # -------- VISUAL BOX FOR DEMO --------
-
-                if fall_state["fall_detected"] or fall_state["lying"]:
-                    h, w, _ = annotated.shape
-                    cv2.rectangle(
-                        annotated,
-                        (0, 0),
-                        (w, h),
-                        (0, 0, 255),
-                        5
-                    )
-
-                # -------- MONITOR TEXT --------
-
-                if monitor_state["monitoring"]:
-
-                    cv2.putText(
-                        annotated,
-                        "Monitoring after fall...",
-                        (10, 95),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 0),
-                        2,
-                    )
-
-                if monitor_state["no_movement_elapsed"] > 0:
-
-                    cv2.putText(
-                        annotated,
-                        f"No movement: {int(monitor_state['no_movement_elapsed'])}s",
-                        (10, 120),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 0, 255),
-                        2,
-                    )
-
-                if alert_state["alert_sent_now"]:
-                    status_text = "ALERT SENT"
-                    color = (0, 0, 255)
-
-                if alert_state["escalation_now"]:
-                    status_text = "ESCALATION SENT"
-                    color = (0, 0, 255)
-
-                # -------- DEBUG INFO --------
-
-                cv2.putText(
-                    annotated,
-                    f"height={fall_state['height']:.2f} angle={fall_state['angle']:.1f}",
-                    (10, 70),
+        cv2.putText(frame,debug_text,(20,80),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
-                    (255, 255, 255),
-                    2,
-                )
+                    (255,255,0),
+                    2)
 
-            # -------- MAIN STATUS TEXT --------
+    # detect fall
+    fall = detect_fall(data)
 
-            cv2.putText(
-                annotated,
-                status_text,
-                (10, 30),
+    if fall and not recording_active and not alert_cooldown:
+
+        print("Possible fall detected")
+
+        cv2.imwrite("fall_snapshot.jpg",frame)
+
+        start_recording(frame)
+
+        recording_active = True
+        fall_start_time = time.time()
+
+    # recording process
+    if recording_active:
+
+        record_frame(frame)
+
+        elapsed = int(time.time() - fall_start_time)
+
+        status = f"Fall Detected | No Movement: {elapsed}s"
+        color = (0,0,255)
+
+        if recording_finished():
+
+            video_file = stop_recording()
+
+            threading.Thread(
+                target=send_alerts,
+                args=(video_file,),
+                daemon=True
+            ).start()
+
+            recording_active = False
+            fall_start_time = None
+
+            alert_cooldown = True
+            cooldown_start = time.time()
+
+    # display status
+    cv2.putText(frame,status,(20,40),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
+                1,
                 color,
-                2,
-            )
+                2)
 
-            cv2.imshow("Fall Detection Monitoring System", annotated)
+    cv2.imshow("Fall Detection System",frame)
 
-            key = cv2.waitKey(1) & 0xFF
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-            if key in (27, ord("q")):
-                break
-
-    finally:
-
-        cap.release()
-        close_pose_detector()
-        cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    run()
+cap.release()
+cv2.destroyAllWindows()
