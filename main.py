@@ -42,12 +42,13 @@ while True:
     if not ret:
         break
 
+    frame = cv2.flip(frame, 1)
+
     status = "Monitoring"
     color = (0,255,0)
 
     buffer_frame(frame)
 
-    # cooldown after alert
     if alert_cooldown:
         if time.time() - cooldown_start > COOLDOWN_TIME:
             alert_cooldown = False
@@ -55,10 +56,9 @@ while True:
             status = "Cooldown"
             color = (255,255,0)
 
-    # detect camera movement
     if camera_moved(frame):
 
-        status = "Camera Moving"
+        status = "Movement Detected"
         color = (0,255,255)
 
         cv2.putText(frame,status,(20,40),
@@ -66,12 +66,16 @@ while True:
 
         cv2.imshow("Fall Detection System",frame)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('q') or key == 27:
+            break
+
+        if cv2.getWindowProperty("Fall Detection System", cv2.WND_PROP_VISIBLE) < 1:
             break
 
         continue
 
-    # pose detection
     data = get_pose(frame)
 
     if data is not None:
@@ -88,7 +92,6 @@ while True:
                     (255,255,0),
                     2)
 
-    # detect fall
     fall = detect_fall(data)
 
     if fall and not recording_active and not alert_cooldown:
@@ -102,33 +105,52 @@ while True:
         recording_active = True
         fall_start_time = time.time()
 
-    # recording process
     if recording_active:
 
         record_frame(frame)
 
-        elapsed = int(time.time() - fall_start_time)
+        recovered = False
 
-        status = f"Fall Detected | No Movement: {elapsed}s"
-        color = (0,0,255)
+        if data is not None:
+            angle = abs(data["angle"])
+            aspect = data["aspect_ratio"]
 
-        if recording_finished():
+            if aspect < 1.2 and 45 <= angle <= 135:
+                recovered = True
 
-            video_file = stop_recording()
+        if recovered:
 
-            threading.Thread(
-                target=send_alerts,
-                args=(video_file,),
-                daemon=True
-            ).start()
+            print("Recovery posture detected")
 
             recording_active = False
             fall_start_time = None
 
-            alert_cooldown = True
-            cooldown_start = time.time()
+            status = "Recovery Detected"
+            color = (0,255,0)
 
-    # display status
+        else:
+
+            elapsed = int(time.time() - fall_start_time)
+
+            status = f"Fall Detected | No Movement: {elapsed}s"
+            color = (0,0,255)
+
+            if recording_finished():
+
+                video_file = stop_recording()
+
+                threading.Thread(
+                    target=send_alerts,
+                    args=(video_file,),
+                    daemon=True
+                ).start()
+
+                recording_active = False
+                fall_start_time = None
+
+                alert_cooldown = True
+                cooldown_start = time.time()
+
     cv2.putText(frame,status,(20,40),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1,
@@ -137,7 +159,12 @@ while True:
 
     cv2.imshow("Fall Detection System",frame)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord('q') or key == 27:
+        break
+
+    if cv2.getWindowProperty("Fall Detection System", cv2.WND_PROP_VISIBLE) < 1:
         break
 
 cap.release()
